@@ -1,0 +1,9 @@
+[Plugin]
+Loader=python3
+Module=markdown-preview
+IAge=3
+Name=Markdown Preview
+Description=Live Markdown preview in a bottom panel using WebKit.
+Authors=Rudrava Roy
+Website=https://github.com/linuxmint/xed
+Version=0.1
