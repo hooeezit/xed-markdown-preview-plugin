@@ -86,101 +86,163 @@ class MarkdownPreview(GObject.Object, Xed.WindowActivatable):
         self._web = None
         self._timeout_id = 0
         self._buffer_handler_ids = []
-        self._window_handlers = []
         self._connected_doc = None
+        self._window_handlers = []
+        self._bottom_handlers = []
+        self._bottom = None
 
-    def _is_markdown_doc(self, doc):
-        #print("markdown-preview: Checking if document is a markdown")
-        if not doc:
-            #print("markdown-preview: No document available, not activating markdown plugin")
-            return False
-        try:
-            gfile = doc.get_location()
-            if gfile:
-                name = gfile.get_basename().lower()
-                if name.endswith((".md", ".markdown")):
-                    return True
-            #else:
-            #    print("markdown-preview: Doc location unknown")
-            # MIME-type fallback (works for unsaved buffers)
-            content_type = doc.get_content_type()
-            if content_type and "markdown" in content_type.lower():
-                return True
-            #else:
-            #    print("markdown-preview: content_type = {}".format(content_type))
-        except Exception as ex:
-            #pass
-            print("markdown-preview: {}".format(ex))
-        return False
-    
-    # ---- lifecycle ----
+    # ---------------- lifecycle ----------------
     def do_activate(self):
-        # Create preview widgetry
+        # Build widgets, but DON'T add to panel yet
         self._web = WebKit2.WebView()
         self._sw = Gtk.ScrolledWindow()
         self._sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self._sw.add(self._web)
         self._sw.show_all()
 
-        # Add as a bottom panel tab
-        bottom = self.window.get_bottom_panel()
-        self._panel_item = bottom.add_item(
-            self._sw,
-            "xed-markdown-preview",
-            "Markdown Preview",
-            # "text-x-generic"  # a generic icon name that should exist
-        )
-        bottom.set_visible(True)
-        bottom.activate_item(self._sw)
+        self._bottom = self.window.get_bottom_panel()
+        self._panel_item = self._bottom.add_item(self._sw, "xed-markdown-preview", "Markdown Preview")
+        # self._bottom.activate_item(self._sw)
 
-        # Listen to window/tab changes
+        # react to tab/window changes
         self._window_handlers.append(self.window.connect("active-tab-changed", self._on_active_tab_changed))
         self._window_handlers.append(self.window.connect("tab-added", self._on_tab_changed))
         self._window_handlers.append(self.window.connect("tab-removed", self._on_tab_changed))
 
-        # Hook current document
-        self._reconnect_to_active_buffer()
-        self._render_now()
+        try:
+            self._bottom.connect("notify::visible", lambda *a: (self._sync_panel_visibility(), None))
+        except Exception:
+            pass
 
     def do_deactivate(self):
         self._disconnect_from_buffer()
+
         for hid in self._window_handlers:
             self.window.disconnect(hid)
         self._window_handlers.clear()
 
-        if self._panel_item is not None:
-            bottom = self.window.get_bottom_panel()
-            bottom.remove_item(self._sw)
-            self._panel_item = None
+        if self._bottom and self._bottom_handlers:
+            for hid in self._bottom_handlers:
+                try:
+                    self._bottom.disconnect(hid)
+                except Exception:
+                    pass
+            self._bottom_handlers.clear()
 
+        # Remove our tab if present, but DO NOT change panel visibility
+        if self._sw and self._sw.get_parent():
+            try:
+                self._bottom.remove_item(self._sw)
+            except Exception:
+                pass
+
+        self._panel_item = None
         self._web = None
         self._sw = None
+        self._bottom = None
 
         if self._timeout_id:
             GLib.source_remove(self._timeout_id)
             self._timeout_id = 0
 
-    # ---- helpers ----
+    # ---------------- helpers ----------------
+    def _bottom_is_visible(self):
+        if not self._bottom:
+            return False
+        try:
+            return bool(self._bottom.get_visible())
+        except Exception:
+            try:
+                return bool(self._bottom.props.visible)
+            except Exception:
+                return False
+
+    def _has_tab(self):
+        return bool(self._sw and self._sw.get_parent())
+
+    def _attach_tab(self):
+        if self._sw and not self._has_tab():
+            self._panel_item = self._bottom.add_item(self._sw, "xed-markdown-preview", "Markdown Preview")
+            self._bottom.activate_item(self._sw)
+
+    def _detach_tab(self):
+        if self._sw and self._has_tab():
+            try:
+                self._bottom.remove_item(self._sw)
+            except Exception:
+                pass
+            self._panel_item = None
+
+    def _is_markdown_doc(self, doc):
+        if not doc:
+            return False
+        try:
+            gfile = doc.get_location()
+            if gfile:
+                name = gfile.get_basename().lower()
+                if name.endswith((".md", ".markdown", ".mdown", ".mkd", ".mkdown")):
+                    return True
+            # MIME fallback (unsaved buffers)
+            ctype = doc.get_content_type()
+            if ctype and "markdown" in ctype.lower():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _sync_panel_visibility(self):
+        doc = self.window.get_active_document()
+        is_md = self._is_markdown_doc(doc)
+        visible = self._bottom_is_visible()
+        attached = self._has_tab()
+
+        if not is_md:
+            # Rule 1: Non-markdown → hide the panel and ensure tab is detached
+            if visible:
+                try:
+                    self._bottom.set_visible(False)
+                except Exception:
+                    # Some builds might use a different setter, but set_visible is typical
+                    pass
+                visible = False  # reflect new state
+            return
+
+        # From here: is_md == True
+        if visible and not attached:
+            # Rule 2: MD + panel ON + not attached → attach + render
+            self._attach_tab()
+            self._render_now()
+            return
+
+        if visible and attached:
+            # Rule 3: MD + panel ON + attached → re-render
+            self._render_now()
+            return
+
+        # Rule 4: MD + panel OFF → do nothing
+        return
+
+    def _on_bottom_visibility(self, *args):
+        # User toggled bottom panel; resync our tab
+        self._sync_panel_visibility()
+        
+
     def _on_active_tab_changed(self, window, tab):
         self._reconnect_to_active_buffer()
-        self._render_now()
+        self._sync_panel_visibility()
 
     def _on_tab_changed(self, *args):
         self._reconnect_to_active_buffer()
-        self._render_now()
+        self._sync_panel_visibility()
+        
 
     def _reconnect_to_active_buffer(self):
         self._disconnect_from_buffer()
 
         doc = self.window.get_active_document()
-        if doc is None:
+        if doc is None or not self._is_markdown_doc(doc):
             return
 
-        # (Optional) only hook when it's Markdown
-        if not self._is_markdown_doc(doc):
-            return
-
-        # Connect signals ON THIS doc and remember it
         self._connected_doc = doc
         self._buffer_handler_ids = [
             doc.connect("changed", self._on_buffer_changed),
@@ -192,7 +254,6 @@ class MarkdownPreview(GObject.Object, Xed.WindowActivatable):
             self._buffer_handler_ids.clear()
             return
 
-        # Only disconnect from the SAME doc we connected earlier
         for hid in self._buffer_handler_ids:
             try:
                 if GObject.signal_handler_is_connected(self._connected_doc, hid):
@@ -206,26 +267,19 @@ class MarkdownPreview(GObject.Object, Xed.WindowActivatable):
     def _on_buffer_changed(self, *args):
         if self._timeout_id:
             GLib.source_remove(self._timeout_id)
-        self._timeout_id = GLib.timeout_add(DEBOUNCE_MS, self._render_now)
+        self._timeout_id = GLib.timeout_add(250, self._render_now)
 
     def _get_active_text_and_baseuri(self):
         doc = self.window.get_active_document()
-        #if not doc:
-        #    return "", None
-        if not self._is_markdown_doc(doc):
-            return  "", None
+        if not doc:
+            return "", None
         start = doc.get_start_iter()
         end = doc.get_end_iter()
         text = doc.get_text(start, end, True)
-        # base URI so relative links/images resolve
         location = None
         try:
-            # XedDocuments usually support get_location() like Gedit
             gfile = doc.get_location()
             if gfile:
-                uri = gfile.get_uri()
-                # For base URI we want the directory:
-                # Use parent if available; WebKit accepts file:// URIs
                 parent = gfile.get_parent()
                 if parent:
                     location = parent.get_uri()
@@ -233,8 +287,22 @@ class MarkdownPreview(GObject.Object, Xed.WindowActivatable):
             pass
         return text, location
 
+    def _render_now(self):
+        self._timeout_id = 0
+        # Only render if our tab exists AND the bottom panel is visible
+        if not (self._web and self._has_tab() and self._bottom_is_visible()):
+            return False
+
+        text, base = self._get_active_text_and_baseuri()
+        body = md_to_html(text)
+        html = HTML_SHELL.format(css=self._choose_css(), body=body)
+        try:
+            self._web.load_html(html, base if base else "about:blank")
+        except Exception:
+            pass
+        return False
+
     def _choose_css(self):
-        # follow dark preference if app is dark
         settings = Gtk.Settings.get_default()
         prefer_dark = False
         if settings:
@@ -244,18 +312,3 @@ class MarkdownPreview(GObject.Object, Xed.WindowActivatable):
                 pass
         return DARK_CSS if prefer_dark else LIGHT_CSS
 
-    def _render_now(self):
-        self._timeout_id = 0
-        if not self._web:
-            return False
-
-        text, base = self._get_active_text_and_baseuri()
-        # Render markdown to HTML
-        body = md_to_html(text)
-        html = HTML_SHELL.format(css=self._choose_css(), body=body)
-        try:
-            self._web.load_html(html, base if base else "about:blank")
-        except Exception:
-            # best effort; avoid crashing the plugin
-            pass
-        return False
